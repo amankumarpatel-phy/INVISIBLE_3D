@@ -6,14 +6,15 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 # PyInstaller evaluates paths in a spec relative to the spec file's directory.
 # Resolve the repository root explicitly so this file works from GitHub Actions
 # and from a local checkout.
-ROOT = Path.cwd()
+ROOT = Path.cwd().resolve()
+PARENT = ROOT.parent
 
 hiddenimports = collect_submodules("INVISIBLE_3D")
 datas = collect_data_files("INVISIBLE_3D")
 
 a = Analysis(
     [str(ROOT / "desktop_app" / "main.py")],
-    pathex=[str(ROOT)],
+    pathex=[str(ROOT), str(PARENT)],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,

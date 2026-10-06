@@ -244,41 +244,47 @@ def multislice_propagation(field: np.ndarray, object_3d: np.ndarray,
 # 5. Born Approximation (First-order weak scattering)
 # ============================================================================
 
+def _born_source_propagation(source: np.ndarray, wavelength: float,
+                             z: float, pixel_size: float,
+                             n_medium: float = 1.0) -> np.ndarray:
+    """Forward Green-function propagation of a Born source plane.
+
+    Solves the forward Helmholtz Green-function relation in the angular
+    spectrum domain:
+        G~(fx,fy;z) = i exp(i kz z) / (2 kz)
+    for propagating spatial frequencies.  The transverse integral is
+    discretized with pixel_size**2 outside the FFT convolution.
+    """
+    Ny, Nx = source.shape
+    FX, FY = frequency_grid_2d_rect(Ny, Nx, pixel_size)
+    k0 = wavenumber(wavelength)
+    k = k0 * n_medium
+    f_sq = FX**2 + FY**2
+    propagating = f_sq < (n_medium / wavelength)**2
+    kz = 2 * np.pi * np.sqrt(np.maximum((n_medium / wavelength)**2 - f_sq, 0.0))
+
+    H = np.zeros_like(source, dtype=np.complex128)
+    H[propagating] = (1j / (2.0 * kz[propagating])) * np.exp(1j * kz[propagating] * z)
+
+    return np.fft.ifft2(np.fft.fft2(source) * H) * pixel_size**2
+
+
 def born_forward(incident_field: np.ndarray, scattering_potential: np.ndarray,
                  wavelength: float, pixel_size: float,
                  z_detector: float, n_medium: float = 1.0) -> np.ndarray:
-    """Compute scattered field using first Born approximation (2D).
-    
-    U_s(r) = ∫ G(r-r') · V(r') · U_inc(r') dr'
-    
-    For 2D, computed as convolution with Green's function in Fourier domain:
-      Û_s = Ĝ · F{V · U_inc}
-    
-    Args:
-        incident_field: 2D incident field.
-        scattering_potential: 2D scattering potential V = k²(n²-n_bg²).
-        wavelength: Wavelength [m].
-        pixel_size: Pixel size [m].
-        z_detector: Detector distance [m].
-        n_medium: Background refractive index.
-    
-    Returns:
-        Total field at detector plane (U_inc_propagated + U_s).
+    """Compute the first-Born field for a thin 2D source plane.
+
+    The scattering potential must use
+        V = k0² (n² - n_medium²),
+    where k0 = 2π / wavelength is the vacuum wavenumber.
     """
-    k = wavenumber(wavelength) * n_medium
-    
-    # Source term: V·U_inc
     source = scattering_potential * incident_field
-    
-    # Propagate source term to detector
-    U_scattered = angular_spectrum(source, wavelength, z_detector, pixel_size, n_medium)
-    
-    # Scale by pixel area (discrete approximation of integral)
-    U_scattered *= pixel_size**2
-    
-    # Propagate incident field to detector
-    U_inc_det = angular_spectrum(incident_field, wavelength, z_detector, pixel_size, n_medium)
-    
+    U_scattered = _born_source_propagation(
+        source, wavelength, z_detector, pixel_size, n_medium
+    )
+    U_inc_det = angular_spectrum(
+        incident_field, wavelength, z_detector, pixel_size, n_medium
+    )
     return U_inc_det + U_scattered
 
 
@@ -286,36 +292,27 @@ def born_3d_forward(incident_field: np.ndarray, scattering_potential_3d: np.ndar
                     wavelength: float, pixel_size: float,
                     slice_thickness: float, z_detector: float,
                     n_medium: float = 1.0) -> np.ndarray:
-    """3D first Born approximation using slice-by-slice computation.
-    
-    Sum scattered contributions from each slice and propagate to detector.
-    """
+    """Compute a first-Born 3D field by summing Green-function slice sources."""
     Nz = scattering_potential_3d.shape[0]
-    k = wavenumber(wavelength) * n_medium
-    Ny, Nx = incident_field.shape
-    
-    U_total_scattered = np.zeros((Ny, Nx), dtype=np.complex128)
-    
+    U_total_scattered = np.zeros_like(incident_field, dtype=np.complex128)
+
     for iz in range(Nz):
         z_slice = (iz - Nz // 2) * slice_thickness
         z_to_det = z_detector - z_slice
-        
         if z_to_det <= 0:
             continue
-            
-        # Incident field at this slice (free-space propagation)
-        U_inc_slice = angular_spectrum(incident_field, wavelength, z_slice, pixel_size, n_medium)
-        
-        # Source at this slice
+
+        U_inc_slice = angular_spectrum(
+            incident_field, wavelength, z_slice, pixel_size, n_medium
+        )
         source = scattering_potential_3d[iz] * U_inc_slice
-        
-        # Propagate to detector
-        U_s_contrib = angular_spectrum(source, wavelength, z_to_det, pixel_size, n_medium)
-        U_total_scattered += U_s_contrib * pixel_size**2 * slice_thickness
-    
-    # Incident field at detector
-    U_inc_det = angular_spectrum(incident_field, wavelength, z_detector, pixel_size, n_medium)
-    
+        U_total_scattered += _born_source_propagation(
+            source, wavelength, z_to_det, pixel_size, n_medium
+        ) * slice_thickness
+
+    U_inc_det = angular_spectrum(
+        incident_field, wavelength, z_detector, pixel_size, n_medium
+    )
     return U_inc_det + U_total_scattered
 
 
@@ -342,16 +339,18 @@ def rytov_forward(incident_field: np.ndarray, scattering_potential: np.ndarray,
     Returns:
         Total field at detector using Rytov model.
     """
-    # Compute Born scattered field
-    source = scattering_potential * incident_field
-    U_scattered = angular_spectrum(source, wavelength, z_detector, pixel_size, n_medium)
-    U_scattered *= pixel_size**2
-    
-    # Incident field at detector
-    U_inc_det = angular_spectrum(incident_field, wavelength, z_detector, pixel_size, n_medium)
-    
-    # Rytov complex phase
-    # Avoid division by zero
+    # Compute the first-Born scattered field with the same Green-function
+    # normalization used by born_forward().
+    U_born = born_forward(
+        incident_field, scattering_potential, wavelength,
+        pixel_size, z_detector, n_medium
+    )
+    U_inc_det = angular_spectrum(
+        incident_field, wavelength, z_detector, pixel_size, n_medium
+    )
+    U_scattered = U_born - U_inc_det
+
+    # Rytov complex phase: psi_s = log(U/U_inc), linearized as U_s/U_inc.
     eps = 1e-30
     psi_s = U_scattered / (U_inc_det + eps)
     

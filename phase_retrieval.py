@@ -66,7 +66,7 @@ class PhaseRetriever:
         if p.init_method == 'custom' and p.init_field is not None:
             return p.init_field.copy()
         elif p.init_method == 'zeros':
-            return np.ones(shape, dtype=np.complex128)
+            return np.zeros(shape, dtype=np.complex128)
         elif p.init_method == 'uniform':
             return measured_amplitude.mean() * np.ones(shape, dtype=np.complex128)
         else:  # random

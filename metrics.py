@@ -125,15 +125,16 @@ def refractive_index_error(gt_ri: np.ndarray, recon_ri: np.ndarray) -> Dict[str,
     Returns:
         Dict with real-part error, imaginary-part error, and magnitude error.
     """
+    # Phase is periodic; compare the wrapped phase difference rather
+    # than the raw subtraction across the -pi/pi branch cut.
+    phase_delta = np.angle(np.exp(1j * (np.angle(gt_ri) - np.angle(recon_ri))))
+
     return {
         'real_mse': float(np.mean((gt_ri.real - recon_ri.real)**2)),
         'real_rmse': float(np.sqrt(np.mean((gt_ri.real - recon_ri.real)**2))),
         'imag_mse': float(np.mean((gt_ri.imag - recon_ri.imag)**2)),
         'imag_rmse': float(np.sqrt(np.mean((gt_ri.imag - recon_ri.imag)**2))),
         'magnitude_mse': float(np.mean((np.abs(gt_ri) - np.abs(recon_ri))**2)),
-        # Phase is periodic; compare the wrapped phase difference rather
-        # than the raw subtraction across the -pi/pi branch cut.
-        phase_delta = np.angle(np.exp(1j * (np.angle(gt_ri) - np.angle(recon_ri))))
         'phase_mse': float(np.mean(phase_delta**2)),
     }
 

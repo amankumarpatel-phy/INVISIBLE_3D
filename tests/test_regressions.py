@@ -11,6 +11,7 @@ from INVISIBLE_3D.objects import ObjectGenerator, ObjectParams
 from INVISIBLE_3D.experiment import ExperimentRunner, preset_tomography
 from INVISIBLE_3D.metrics import refractive_index_error
 from INVISIBLE_3D.phase_retrieval import PhaseRetriever, PhaseRetrievalParams
+from INVISIBLE_3D.tomography import TomographyEngine, TomographyParams
 
 
 def test_rectangular_object_grid():
@@ -63,3 +64,26 @@ def test_tomography_preset_angles_are_radians():
     p = preset_tomography()
     assert np.isclose(p.angle_range[0], -np.pi / 3)
     assert np.isclose(p.angle_range[1], np.pi / 3)
+
+
+def test_ewald_tomography_operator_matches_born_data_shape_and_finiteness():
+    p = TomographyParams(
+        Nx=16, Ny=16, Nz=8,
+        pixel_size=1e-6, slice_thickness=1e-6,
+        wavelength=532e-9, n_background=1.33,
+        z_detector=20e-6, num_angles=5,
+        angle_range=(-0.2, 0.2), tikhonov_weight=1e-3,
+    )
+    engine = TomographyEngine(p)
+
+    phantom = np.full((p.Nz, p.Ny, p.Nx), p.n_background, dtype=np.complex128)
+    phantom[p.Nz // 2, p.Ny // 2, p.Nx // 2] += 1e-3
+
+    scattered = engine.forward_born_multi_angle(phantom)
+    assert len(scattered) == p.num_angles
+    assert all(field.shape == (p.Ny, p.Nx) for field in scattered)
+
+    recon = engine.reconstruct_fbp(scattered)
+    assert recon.shape == phantom.shape
+    assert np.all(np.isfinite(recon.real))
+    assert np.all(np.isfinite(recon.imag))

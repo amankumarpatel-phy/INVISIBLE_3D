@@ -11,7 +11,7 @@ Supports binary objects, continuous distributions, and composite structures.
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Union
-from .utils import coordinate_grid_2d, coordinate_grid_3d
+from .utils import coordinate_grid_2d, coordinate_grid_2d_rect, coordinate_grid_3d
 
 
 @dataclass
@@ -49,7 +49,7 @@ class ObjectGenerator:
         p = self.params
         if self.ndim == 2:
             Ny, Nx = p.grid_size
-            self.X, self.Y = coordinate_grid_2d(Nx, p.pixel_size)
+            self.X, self.Y = coordinate_grid_2d_rect(Ny, Nx, p.pixel_size)
             self.R = np.sqrt(self.X**2 + self.Y**2)
         elif self.ndim == 3:
             Nz, Ny, Nx = p.grid_size
@@ -242,10 +242,16 @@ class ObjectGenerator:
         obj = self._empty()
         p = self.params
 
-        # Volume bounds
-        extent_x = (p.grid_size[2] // 2 - 5) * p.pixel_size
-        extent_y = (p.grid_size[1] // 2 - 5) * p.pixel_size
-        extent_z = (p.grid_size[0] // 2 - 5) * p.slice_thickness
+        # Keep particle centers inside the physical volume while leaving
+        # enough margin for the largest particle.  The previous fixed
+        # "- 5 pixels" margin could produce invalid random bounds on small grids.
+        max_radius = float(max(radius_range))
+        half_x = 0.5 * p.grid_size[2] * p.pixel_size
+        half_y = 0.5 * p.grid_size[1] * p.pixel_size
+        half_z = 0.5 * p.grid_size[0] * p.slice_thickness
+        extent_x = max(0.0, half_x - max_radius)
+        extent_y = max(0.0, half_y - max_radius)
+        extent_z = max(0.0, half_z - max_radius)
 
         for _ in range(num_particles):
             cx = rng.uniform(-extent_x, extent_x)

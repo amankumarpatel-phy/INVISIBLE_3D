@@ -7,5 +7,5 @@ intensity-only diffraction measurements using physics-based forward models,
 iterative inverse reconstruction, and optional AI-assisted refinement.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "INVISIBLE³D Research Platform"

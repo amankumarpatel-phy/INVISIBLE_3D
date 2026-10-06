@@ -225,7 +225,7 @@ def preset_tomography() -> ExperimentConfig:
         slice_thickness=0.5e-6,
         wavelength=532e-9,
         num_angles=36,
-        angle_range=[-60, 60],
+        angle_range=[-np.pi / 3, np.pi / 3],
         z_detector=100e-6,
         max_iterations=50,
         tv_weight=0.01,

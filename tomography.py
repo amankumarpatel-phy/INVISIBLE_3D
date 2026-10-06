@@ -169,84 +169,193 @@ class TomographyEngine:
         )
 
     def reconstruct_fbp(self, scattered_fields: List[np.ndarray],
-                        angles: Optional[List[float]] = None) -> np.ndarray:
-        """Filtered back-projection using Fourier diffraction theorem.
-        
-        For each angle θ, the measured scattered field fills an Ewald sphere
-        arc in 3D Fourier space. We accumulate these and inverse-FFT.
-        
-        NOTE: This is an approximate Fourier-space backprojection, not a
-        full Ewald-sphere diffraction-tomography inversion. It is intended
-        for algorithm prototyping and should not be used as a quantitative
-        ODT result without validation against a reference implementation.
-        
+                        angles: Optional[List[float]] = None,
+                        numerical_aperture: Optional[float] = None,
+                        return_scattering_potential: bool = False) -> np.ndarray:
+        """Reconstruct using the first-Born Fourier diffraction theorem.
+
+        Each detector spatial-frequency sample is mapped to the 3-D
+        scattering-vector location
+
+            q = k_s - k_i,
+
+        where |k_i| = |k_s| = k0*n_background.  For illumination tilted
+        about the y axis,
+
+            k_i = (k sin(theta), 0, k cos(theta)).
+
+        The measured detector spectrum supplies transverse components of
+        k_s; its longitudinal component is obtained from the Ewald sphere:
+
+            k_sz = sqrt(k^2 - k_sx^2 - k_sy^2).
+
+        Under the first-Born convention used here,
+
+            U_s_hat(k_sx,k_sy)
+              = i exp(i k_sz z_d) / (2 k_sz) * V_hat(q),
+
+        with V = k0^2 [n^2 - n_background^2].
+
+        The method performs weighted trilinear splatting of the measured
+        V_hat samples onto a Cartesian 3-D Fourier grid and then applies
+        a 3-D inverse FFT.
+
+        IMPORTANT: The input must be the complex *scattered* detector field,
+        not intensity and not the total field. Intensity-only data require a
+        phase-retrieval stage first.
+
         Args:
-            scattered_fields: Complex scattered fields at each angle.
-            angles: Illumination angles.
-        
+            scattered_fields: Complex scattered detector fields [Ny, Nx].
+            angles: Illumination angles in radians.
+            numerical_aperture: Optional detection NA. Defaults to the
+                propagating-wave limit n_background.
+            return_scattering_potential: If True, return V(r) instead of n(r).
+
         Returns:
-            Reconstructed 3D RI distribution.
+            Complex 3-D refractive-index distribution or scattering potential.
         """
         p = self.params
         if angles is None:
             angles = p.angles
-        
-        Ny, Nx = scattered_fields[0].shape
-        
-        # 3D Fourier space accumulator
-        F3D = np.zeros((p.Nz, Ny, Nx), dtype=np.complex128)
-        weight = np.zeros((p.Nz, Ny, Nx), dtype=np.float64)
-        
-        k = wavenumber(p.wavelength) * p.n_background
-        
-        # Frequency grids
+
+        if len(scattered_fields) != len(angles):
+            raise ValueError("Number of scattered fields must equal number of angles.")
+        if len(scattered_fields) == 0:
+            raise ValueError("At least one scattered field is required.")
+
+        fields = [np.asarray(f, dtype=np.complex128) for f in scattered_fields]
+        Ny, Nx = fields[0].shape
+        if any(f.shape != (Ny, Nx) for f in fields):
+            raise ValueError("All scattered fields must have the same shape.")
+
+        k0 = wavenumber(p.wavelength)
+        k = k0 * p.n_background
+        detector_na = p.n_background if numerical_aperture is None else float(numerical_aperture)
+        if detector_na <= 0 or detector_na > p.n_background:
+            raise ValueError("numerical_aperture must satisfy 0 < NA <= n_background.")
+
+        # Detector spatial frequencies -> transverse outgoing wavevector.
         fx = np.fft.fftfreq(Nx, d=p.pixel_size)
         fy = np.fft.fftfreq(Ny, d=p.pixel_size)
-        fz = np.fft.fftfreq(p.Nz, d=p.slice_thickness)
-        
-        FX, FY = np.meshgrid(fx, fy)
-        
-        for angle_idx, theta in enumerate(angles):
-            # 2D Fourier transform of scattered field
-            F2D = np.fft.fft2(scattered_fields[angle_idx])
-            
-            # Map to 3D Fourier space (Ewald sphere mapping)
-            # For small angles, approximate: fz ≈ fx·sin(θ)
-            cos_t = np.cos(theta)
-            sin_t = np.sin(theta)
-            
-            # Rotated frequency coordinates
-            fx_rot = FX * cos_t
-            fz_rot = FX * sin_t
-            
-            # Map to nearest fz slice
-            for iz in range(p.Nz):
-                fz_val = fz[iz]
-                # Weight based on proximity to Ewald sphere
-                w = np.exp(-0.5 * ((fz_rot - fz_val) / (fz[1] - fz[0] + 1e-30))**2)
-                F3D[iz] += F2D * w
-                weight[iz] += w
-        
-        # Normalize
-        weight_safe = np.maximum(weight, 1e-10)
-        F3D /= weight_safe
-        
-        # Regularization (Tikhonov)
+        FX, FY = np.meshgrid(fx, fy, indexing='xy')
+        KSX = 2.0 * np.pi * FX
+        KSY = 2.0 * np.pi * FY
+        ks_rho = np.sqrt(KSX**2 + KSY**2)
+
+        propagating = ks_rho < (k * detector_na / p.n_background)
+        KSZ = np.zeros_like(KSX)
+        KSZ[propagating] = np.sqrt(
+            np.maximum(k**2 - KSX[propagating]**2 - KSY[propagating]**2, 0.0)
+        )
+
+        # Cartesian object Fourier grid in shifted ordering.
+        qx = 2.0 * np.pi * np.fft.fftshift(np.fft.fftfreq(Nx, d=p.pixel_size))
+        qy = 2.0 * np.pi * np.fft.fftshift(np.fft.fftfreq(Ny, d=p.pixel_size))
+        qz = 2.0 * np.pi * np.fft.fftshift(
+            np.fft.fftfreq(p.Nz, d=p.slice_thickness)
+        )
+        dqx = 2.0 * np.pi / (Nx * p.pixel_size)
+        dqy = 2.0 * np.pi / (Ny * p.pixel_size)
+        dqz = 2.0 * np.pi / (p.Nz * p.slice_thickness)
+
+        F_shift = np.zeros((p.Nz, Ny, Nx), dtype=np.complex128)
+        W_shift = np.zeros((p.Nz, Ny, Nx), dtype=np.float64)
+
+        # Fourier transform convention: numpy FFT is sum(exp(-2π i f x)).
+        # Multiplying by the pixel volume converts it to the continuous
+        # Fourier integral convention used by the Born Green function.
+        detector_pixel_area = p.pixel_size ** 2
+
+        for field, theta in zip(fields, angles):
+            F_det = np.fft.fft2(field)
+
+            # Incident wavevector for the x-z illumination geometry.
+            kix = k * np.sin(theta)
+            kiy = 0.0
+            kiz = k * np.cos(theta)
+
+            valid = propagating & (KSZ > 0)
+            if not np.any(valid):
+                continue
+
+            # Remove the detector propagation phase and invert the Green
+            # function factor to estimate V_hat at the Ewald sample.
+            phase = np.exp(1j * KSZ * p.z_detector)
+            V_hat_sample = (
+                F_det * detector_pixel_area
+                * (2.0 * KSZ / (1j * phase))
+            )
+
+            QX = KSX - kix
+            QY = KSY - kiy
+            QZ = KSZ - kiz
+
+            # Splat valid samples into the eight neighboring Cartesian
+            # Fourier voxels using trilinear weights.
+            ix_f = (QX - qx[0]) / dqx
+            iy_f = (QY - qy[0]) / dqy
+            iz_f = (QZ - qz[0]) / dqz
+
+            valid &= (
+                (ix_f >= 0) & (ix_f < Nx - 1) &
+                (iy_f >= 0) & (iy_f < Ny - 1) &
+                (iz_f >= 0) & (iz_f < p.Nz - 1)
+            )
+            if not np.any(valid):
+                continue
+
+            ix0 = np.floor(ix_f[valid]).astype(np.int64)
+            iy0 = np.floor(iy_f[valid]).astype(np.int64)
+            iz0 = np.floor(iz_f[valid]).astype(np.int64)
+            dx = ix_f[valid] - ix0
+            dy = iy_f[valid] - iy0
+            dz = iz_f[valid] - iz0
+            values = V_hat_sample[valid]
+
+            for oz, wz in ((0, 1.0 - dz), (1, dz)):
+                for oy, wy in ((0, 1.0 - dy), (1, dy)):
+                    for ox, wx in ((0, 1.0 - dx), (1, dx)):
+                        weights = wx * wy * wz
+                        np.add.at(
+                            F_shift,
+                            (iz0 + oz, iy0 + oy, ix0 + ox),
+                            values * weights,
+                        )
+                        np.add.at(
+                            W_shift,
+                            (iz0 + oz, iy0 + oy, ix0 + ox),
+                            weights,
+                        )
+
+        # Normalize only where the Ewald mapping actually supplied data.
+        covered = W_shift > 0
+        F_shift[covered] /= W_shift[covered]
+
+        # Tikhonov damping based on sampling coverage.
         if p.tikhonov_weight > 0:
-            F3D *= weight_safe / (weight_safe + p.tikhonov_weight)
-        
-        # Inverse 3D FFT
-        recon = np.fft.ifftn(F3D)
-        
-        # Convert scattering potential to RI
-        # V = k² (n² - n_bg²) ≈ 2k²·n_bg·Δn for weak scattering
-        delta_n = recon.real / (2 * k**2 * p.n_background + 1e-30)
-        recon_ri = p.n_background + delta_n
-        
-        # Apply constraints
+            F_shift *= W_shift / (W_shift + p.tikhonov_weight)
+
+        # Return to FFT ordering and convert the continuous Fourier integral
+        # back to a spatial distribution.  For a sampled transform pair,
+        # V(r) = ifftn(F_hat) / voxel_volume.
+        F_fft = np.fft.ifftshift(F_shift)
+        voxel_volume = p.pixel_size ** 2 * p.slice_thickness
+        scattering_potential = np.fft.ifftn(F_fft) / voxel_volume
+
+        if return_scattering_potential:
+            return scattering_potential
+
+        # Exact first-Born conversion:
+        # V = k0^2 (n^2 - n_bg^2)  =>  n = sqrt(n_bg^2 + V/k0^2).
+        recon_ri = np.sqrt(
+            p.n_background**2 + scattering_potential / (k0**2)
+        )
+
         if p.positivity:
-            recon_ri = np.maximum(recon_ri.real, p.ri_bounds[0]) + 1j * np.maximum(recon_ri.imag, 0)
-        
+            recon_ri = np.maximum(recon_ri.real, p.ri_bounds[0]) + 1j * np.maximum(
+                recon_ri.imag, 0.0
+            )
+
         return recon_ri
 
     def reconstruct_gradient(self, intensities: List[np.ndarray],

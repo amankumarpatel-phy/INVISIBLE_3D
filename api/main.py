@@ -141,7 +141,13 @@ def _simulation_task(job_id: str, request: SimulationRequest) -> Dict[str, Any]:
             "kind": kind,
             "shape": list(phantom.shape),
             "num_angles": len(angles),
+            "angles_rad": angles,
             "forward_model": request.forward_model,
+            "pixel_size": request.pixel_size,
+            "slice_thickness": dz,
+            "wavelength": request.wavelength,
+            "background_ri": request.background_ri,
+            "z_detector": request.z_detector,
         }
     }
 
@@ -169,26 +175,11 @@ def info() -> Dict[str, Any]:
 @app.post("/simulate", response_model=JobResponse, status_code=202)
 def simulate(request: SimulationRequest) -> JobResponse:
     _validate_grid(request)
-
-    # Submit a closure with a pre-created job ID so its data can be stored in
-    # the same directory from the moment the worker starts.
-    placeholder = jobs.submit("simulation", lambda: {"metadata": {}})
-    # The placeholder job is converted into a real simulation by scheduling the
-    # actual task through the manager's worker.  This avoids exposing internal
-    # Future objects through the API.
-    job_snapshot = jobs.get(placeholder)
-    if job_snapshot is None:
-        raise HTTPException(status_code=500, detail="Failed to create job")
-
-    # Re-submit using the existing ID by running the task directly in a fresh
-    # worker submission through the manager internals is intentionally avoided.
-    # Instead, create a new job whose task performs the work and report the new ID.
-    # The placeholder completes immediately and is harmless.
-    real_job = jobs.submit("simulation", lambda: _simulation_task(real_job_id_holder[0], request))
-    # Replace the closure's placeholder ID safely before the worker can execute.
-    # With a single worker the real task is queued behind the already-finished placeholder.
-    real_job_id_holder[0] = real_job
-    return JobResponse(job_id=real_job, status="queued", message="Simulation submitted")
+    job_id = jobs.submit(
+        "simulation",
+        lambda jid: _simulation_task(jid, request),
+    )
+    return JobResponse(job_id=job_id, status="queued", message="Simulation submitted")
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
@@ -213,28 +204,18 @@ def reconstruct_ewald(request: EwaldReconstructionRequest) -> JobResponse:
     if source_job["status"] != "completed":
         raise HTTPException(status_code=409, detail="Source job is not completed")
 
-    try:
-        data = jobs.load_arrays(request.job_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
+    data = jobs.load_arrays(request.job_id)
     if "scattered_fields" not in data:
-        raise HTTPException(status_code=422, detail="Source job does not contain complex Born scattered fields")
+        raise HTTPException(
+            status_code=422,
+            detail="Source job does not contain complex Born scattered fields",
+        )
 
     fields = data["scattered_fields"]
     truth = data["ground_truth"]
     nz, ny, nx = truth.shape
     metadata = source_job.get("result") or {}
     num_angles = int(metadata.get("num_angles", fields.shape[0]))
-
-    def task(job_id: str) -> Dict[str, Any]:
-        # Use metadata stored by the simulation defaults; the source arrays are
-        # already generated with those physical parameters.
-        raise RuntimeError("Ewald task wiring placeholder")
-
-    # The first API version deliberately keeps reconstruction requests explicit.
-    # We construct an independent task below using data dimensions and standard
-    # metadata persisted with the source job.
     return _submit_ewald_job(request, fields, truth, nz, ny, nx, num_angles)
 
 
@@ -254,6 +235,8 @@ def reconstruct_gradient(request: GradientReconstructionRequest) -> JobResponse:
     angles = metadata.get("angles_rad")
     if not angles:
         raise HTTPException(status_code=422, detail="Source metadata has no illumination angles")
+    if not angles:
+        raise HTTPException(status_code=422, detail="Source metadata has no illumination angles")
 
     intensities = data["intensities"]
     truth = data["ground_truth"]
@@ -264,10 +247,11 @@ def reconstruct_gradient(request: GradientReconstructionRequest) -> JobResponse:
             Nx=nx,
             Ny=ny,
             Nz=nz,
-            pixel_size=1e-6,
-            slice_thickness=1e-6,
-            wavelength=532e-9,
-            n_background=float(np.real(np.mean(truth[0]))),
+            pixel_size=float(metadata["pixel_size"]),
+            slice_thickness=float(metadata["slice_thickness"]),
+            wavelength=float(metadata["wavelength"]),
+            n_background=float(metadata["background_ri"]),
+            z_detector=float(metadata["z_detector"]),
             num_angles=len(angles),
             angles=[float(x) for x in angles],
             max_iterations=request.max_iterations,
@@ -278,11 +262,12 @@ def reconstruct_gradient(request: GradientReconstructionRequest) -> JobResponse:
             angles=[float(x) for x in angles],
         )
         jobs.save_result(job_id, reconstruction=result, ground_truth=truth)
-        return {"metadata": {"kind": "gradient_reconstruction", "shape": list(result.shape)}}
+        return {"metadata": {"kind": "gradient_reconstruction", "shape": list(result.shape), "iterations": request.max_iterations}}
 
-    job_id_holder = [""]
-    job_id = jobs.submit("gradient_reconstruction", lambda: task(job_id_holder[0]))
-    job_id_holder[0] = job_id
+    job_id = jobs.submit(
+        "gradient_reconstruction",
+        lambda jid: task(jid),
+    )
     return JobResponse(job_id=job_id, status="queued", message="Gradient reconstruction submitted")
 
 
@@ -308,11 +293,11 @@ def _submit_ewald_job(
             Nx=nx,
             Ny=ny,
             Nz=nz,
-            pixel_size=1e-6,
-            slice_thickness=1e-6,
-            wavelength=532e-9,
-            n_background=1.33,
-            z_detector=20e-6,
+            pixel_size=float(metadata["pixel_size"]),
+            slice_thickness=float(metadata["slice_thickness"]),
+            wavelength=float(metadata["wavelength"]),
+            n_background=float(metadata["background_ri"]),
+            z_detector=float(metadata["z_detector"]),
             num_angles=len(angles),
             angles=[float(x) for x in angles],
         )
@@ -332,9 +317,10 @@ def _submit_ewald_job(
             }
         }
 
-    job_id_holder = [""]
-    job_id = jobs.submit("ewald_reconstruction", lambda: task(job_id_holder[0]))
-    job_id_holder[0] = job_id
+    job_id = jobs.submit(
+        "ewald_reconstruction",
+        lambda jid: task(jid),
+    )
     return JobResponse(job_id=job_id, status="queued", message="Ewald reconstruction submitted")
 
 

@@ -42,6 +42,7 @@ class NeuralParams:
     # Device
     device: str = 'cpu'
     seed: int = 42
+    background_ri: float = 1.0
 
 
 def _check_torch():
@@ -54,7 +55,7 @@ class ReconstructionCNN(nn.Module):
     
     Architecture: U-Net-like encoder-decoder with skip connections.
     Input: measured intensity (1 or N channels for multi-distance)
-    Output: predicted amplitude and phase (2 channels)
+    Output: predicted Δn and extinction coefficient κ (2 channels)
     """
 
     def __init__(self, in_channels: int = 1, out_channels: int = 2,
@@ -180,12 +181,15 @@ class NeuralReconstructor:
             # Normalize
             I_norm = I / (I.max() + 1e-30)
             
-            # Object: amplitude and phase channels
-            amp = np.abs(obj)
-            phase = np.angle(obj)
+            # Learn physically meaningful RI parameters rather than the
+            # magnitude/phase of the complex RI itself.
+            # Channel 0 = refractive-index contrast Δn
+            # Channel 1 = extinction coefficient κ
+            delta_n = obj.real - self.params.background_ri
+            kappa = obj.imag
             
             intensities.append(I_norm[np.newaxis, :, :])
-            objects.append(np.stack([amp, phase], axis=0))
+            objects.append(np.stack([delta_n, kappa], axis=0))
         
         return np.array(intensities), np.array(objects)
 
@@ -289,15 +293,16 @@ class NeuralReconstructor:
         with torch.no_grad():
             pred = self.model(x)
         
-        # Convert to complex
+        # Convert predicted physical parameters back to complex RI.
         pred_np = pred.cpu().numpy()[0]
-        amplitude = pred_np[0]
-        phase = pred_np[1]
+        delta_n = pred_np[0]
+        kappa = pred_np[1]
         
-        return amplitude * np.exp(1j * phase)
+        return (self.params.background_ri + delta_n) + 1j * kappa
 
     def predict_and_refine(self, intensity: np.ndarray,
                            refine_fn,
+                           measurements: Optional[List[np.ndarray]] = None,
                            **refine_kwargs) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """AI prediction followed by physics refinement.
         
@@ -309,14 +314,15 @@ class NeuralReconstructor:
         Returns:
             (ai_prediction, refined_result, pure_physics_result)
         """
-        # AI prediction
+        # Multi-measurement physics solvers generally expect a list of
+        # detector intensities.  Preserve an explicit escape hatch for callers
+        # that have more than one measurement.
+        if measurements is None:
+            measurements = [intensity]
+        
         ai_pred = self.predict(intensity)
-        
-        # Physics refinement of AI prediction
-        refined = refine_fn(intensity, initial_guess=ai_pred, **refine_kwargs)
-        
-        # Pure physics (no AI init)
-        pure_physics = refine_fn(intensity, **refine_kwargs)
+        refined = refine_fn(measurements, initial_guess=ai_pred, **refine_kwargs)
+        pure_physics = refine_fn(measurements, **refine_kwargs)
         
         return ai_pred, refined, pure_physics
 

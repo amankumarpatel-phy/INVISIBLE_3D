@@ -131,7 +131,10 @@ def refractive_index_error(gt_ri: np.ndarray, recon_ri: np.ndarray) -> Dict[str,
         'imag_mse': float(np.mean((gt_ri.imag - recon_ri.imag)**2)),
         'imag_rmse': float(np.sqrt(np.mean((gt_ri.imag - recon_ri.imag)**2))),
         'magnitude_mse': float(np.mean((np.abs(gt_ri) - np.abs(recon_ri))**2)),
-        'phase_mse': float(np.mean((np.angle(gt_ri) - np.angle(recon_ri))**2)),
+        # Phase is periodic; compare the wrapped phase difference rather
+        # than the raw subtraction across the -pi/pi branch cut.
+        phase_delta = np.angle(np.exp(1j * (np.angle(gt_ri) - np.angle(recon_ri))))
+        'phase_mse': float(np.mean(phase_delta**2)),
     }
 
 

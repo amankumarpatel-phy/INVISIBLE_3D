@@ -34,7 +34,7 @@ class JobManager:
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def submit(self, kind: str, fn: Callable[[], Dict[str, Any]]) -> str:
+    def submit(self, kind: str, fn: Callable[[str], Dict[str, Any]]) -> str:
         job_id = uuid.uuid4().hex
         job_dir = self.root / job_id
         job_dir.mkdir(parents=True, exist_ok=False)
@@ -54,13 +54,13 @@ class JobManager:
             self._jobs[job_id]["future"] = future
         return job_id
 
-    def _run(self, job_id: str, fn: Callable[[], Dict[str, Any]]) -> None:
+    def _run(self, job_id: str, fn: Callable[[str], Dict[str, Any]]) -> None:
         with self._lock:
             self._jobs[job_id]["status"] = "running"
             self._jobs[job_id]["started_at"] = self._now()
 
         try:
-            result = fn()
+            result = fn(job_id)
             metadata = result.get("metadata", {})
             with self._lock:
                 self._jobs[job_id]["status"] = "completed"

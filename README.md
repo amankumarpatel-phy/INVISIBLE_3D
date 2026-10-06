@@ -53,7 +53,7 @@ The current repository keeps the Python modules at the repository root so that t
 
 1. Validate forward models against analytical solutions.
 2. Add adjoint/gradient finite-difference checks.
-3. Implement a full Ewald-sphere diffraction-tomography operator.
+3. Implemented an Ewald-sphere diffraction-tomography operator using q = k_s - k_i mapping.
 4. Add quantitative Born/Rytov validation against known weak-scattering phantoms.
 5. Add reproducible benchmark datasets and reconstruction reports.
 6. Add continuous integration for regression tests.

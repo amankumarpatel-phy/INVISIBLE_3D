@@ -16,6 +16,7 @@ import json
 import os
 import datetime
 import hashlib
+import copy
 import numpy as np
 from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, List, Any
@@ -155,7 +156,11 @@ class ExperimentRunner:
         }
         
         for val in param_values:
-            config = ExperimentConfig(**base_config.to_dict())
+            # Deep-copy the dataclass instead of reconstructing it from
+            # JSON-normalized data.  to_dict() intentionally serializes inf/nan
+            # as strings, which made parametric-study configurations contain
+            # string-valued numerical parameters such as "inf".
+            config = copy.deepcopy(base_config)
             setattr(config, param_name, val)
             config.timestamp = datetime.datetime.now().isoformat()
             

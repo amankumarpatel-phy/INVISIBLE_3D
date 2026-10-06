@@ -144,21 +144,29 @@ class TomographyEngine:
         
         return intensities
 
+    def extract_amplitude(self, intensities: List[np.ndarray]) -> List[np.ndarray]:
+        """Convert intensity measurements to measured amplitudes.
+
+        This is an amplitude operation only.  Intensity-only data do not
+        contain the detector-plane phase, so taking sqrt(I) must never be
+        labeled as phase retrieval.
+        """
+        return [np.sqrt(np.maximum(I, 0.0)) for I in intensities]
+
     def extract_phase(self, intensities: List[np.ndarray],
                       angles: Optional[List[float]] = None) -> List[np.ndarray]:
-        """Extract phase from intensity measurements using simple heuristic.
-        
-        For a more rigorous approach, use phase retrieval first.
-        Here we assume access to the complex field (or use sqrt as amplitude).
-        
-        In practice, this would be replaced by actual phase retrieval.
+        """Retrieve detector phase.
+
+        Phase cannot be recovered from a single intensity measurement by
+        sqrt(I).  Use a dedicated phase-retrieval method (for example
+        multi-distance phase retrieval) before calling a complex-field
+        tomography algorithm.
         """
-        phases = []
-        for I in intensities:
-            # Placeholder: in real experiments, phase must be retrieved
-            # Here we just store the amplitude for projection
-            phases.append(np.sqrt(np.maximum(I, 0)))
-        return phases
+        raise NotImplementedError(
+            "Intensity-only measurements do not provide phase. "
+            "Run a phase-retrieval algorithm first and pass complex "
+            "scattered fields to the tomography reconstruction."
+        )
 
     def reconstruct_fbp(self, scattered_fields: List[np.ndarray],
                         angles: Optional[List[float]] = None) -> np.ndarray:
@@ -167,7 +175,10 @@ class TomographyEngine:
         For each angle θ, the measured scattered field fills an Ewald sphere
         arc in 3D Fourier space. We accumulate these and inverse-FFT.
         
-        Simplified 2D slice version (projection-based).
+        NOTE: This is an approximate Fourier-space backprojection, not a
+        full Ewald-sphere diffraction-tomography inversion. It is intended
+        for algorithm prototyping and should not be used as a quantitative
+        ODT result without validation against a reference implementation.
         
         Args:
             scattered_fields: Complex scattered fields at each angle.
@@ -238,96 +249,129 @@ class TomographyEngine:
         
         return recon_ri
 
-    def reconstruct_sirt(self, intensities: List[np.ndarray],
-                         angles: Optional[List[float]] = None,
-                         progress_callback=None) -> np.ndarray:
-        """SIRT-like iterative reconstruction.
-        
-        Iteratively refines the 3D object to match measured data.
-        
-        At each iteration:
-          1. Forward simulate all angles
-          2. Compare with measured intensities
-          3. Backproject the residual
-          4. Update the object
-        
-        Args:
-            intensities: Measured intensity patterns.
-            angles: Illumination angles.
-            progress_callback: Optional callback(iteration, error).
-        
-        Returns:
-            Reconstructed 3D RI distribution.
+    def reconstruct_gradient(self, intensities: List[np.ndarray],
+                            angles: Optional[List[float]] = None,
+                            progress_callback=None) -> np.ndarray:
+        """Reconstruct RI by gradient descent through the multislice model.
+
+        Unlike the previous residual backprojection, this computes the
+        derivative of the nonlinear intensity loss through every multislice
+        transmission and propagation step.  It is therefore an adjoint-style
+        optimization method rather than a projection-space SIRT algorithm.
         """
         p = self.params
         if angles is None:
             angles = p.angles
-        
-        # Initialize with uniform background
+        if len(intensities) != len(angles):
+            raise ValueError("Number of intensity measurements must equal number of angles.")
+
         recon = np.full((p.Nz, p.Ny, p.Nx), p.n_background, dtype=np.complex128)
-        
         self.errors = []
-        step_size = 0.01  # Conservative step size
-        
+        step_size = 1e-4
+        k0 = wavenumber(p.wavelength)
+
         for iteration in range(p.max_iterations):
+            gradient_real = np.zeros(recon.shape, dtype=np.float64)
+            gradient_imag = np.zeros(recon.shape, dtype=np.float64)
             total_error = 0.0
-            gradient = np.zeros_like(recon)
-            
+
             for angle_idx, theta in enumerate(angles):
-                # Forward: simulate measurement with current estimate
-                inc = tilted_plane_wave(p.Ny, p.Nx, p.pixel_size, p.wavelength,
-                                        theta_x=theta, theta_y=0, n_medium=p.n_background)
-                
-                exit_field = multislice_propagation(
-                    inc, recon, p.wavelength, p.pixel_size,
-                    p.slice_thickness, p.n_background
+                inc = tilted_plane_wave(
+                    p.Ny, p.Nx, p.pixel_size, p.wavelength,
+                    theta_x=theta, theta_y=0, n_medium=p.n_background
                 )
-                
-                det_field = angular_spectrum(exit_field, p.wavelength, p.z_detector,
-                                             p.pixel_size, p.n_background)
-                
-                I_pred = np.abs(det_field)**2
-                I_meas = intensities[angle_idx]
-                
-                # Residual
-                residual = I_pred - I_meas
-                total_error += np.sum(residual**2)
-                
-                # Simple backprojection: distribute residual back through slices
-                # This is an approximate gradient
-                residual_field = 2 * det_field * residual
-                
-                # Back-propagate to object plane
-                back_field = angular_spectrum(residual_field, p.wavelength, -p.z_detector,
-                                              p.pixel_size, p.n_background)
-                
-                k = wavenumber(p.wavelength)
+
+                # Store the field entering each slice and the transmission
+                # factor so the detector loss can be differentiated exactly.
+                U = inc.astype(np.complex128)
+                incoming = []
+                transmissions = []
                 for iz in range(p.Nz):
-                    # Approximate gradient contribution
-                    gradient[iz] += (back_field * np.conj(inc)).real * p.slice_thickness
-            
-            # Normalize gradient
-            gradient /= len(angles)
-            
-            # Update
-            recon -= step_size * gradient
-            
-            # Regularization: Total Variation
+                    incoming.append(U.copy())
+                    delta_n = recon[iz] - p.n_background
+                    T = np.exp(1j * k0 * delta_n * p.slice_thickness)
+                    transmissions.append(T)
+                    U = U * T
+                    if iz < p.Nz - 1:
+                        U = angular_spectrum(
+                            U, p.wavelength, p.slice_thickness,
+                            p.pixel_size, p.n_background
+                        )
+
+                det_field = angular_spectrum(
+                    U, p.wavelength, p.z_detector,
+                    p.pixel_size, p.n_background
+                )
+                I_pred = np.abs(det_field) ** 2
+                residual = I_pred - intensities[angle_idx]
+                total_error += float(np.mean(residual ** 2))
+
+                # d(sum residual^2)/dU* in the real-valued convention.
+                adj = 2.0 * residual * det_field
+                adj = angular_spectrum(
+                    adj, p.wavelength, -p.z_detector,
+                    p.pixel_size, p.n_background
+                )
+
+                # Reverse-mode differentiation through the multislice chain.
+                for iz in range(p.Nz - 1, -1, -1):
+                    U_in = incoming[iz]
+                    T = transmissions[iz]
+                    U_after = U_in * T
+
+                    dU_dn = 1j * k0 * p.slice_thickness * U_after
+                    dU_dkappa = -k0 * p.slice_thickness * U_after
+
+                    gradient_real[iz] += 2.0 * np.real(np.conj(adj) * dU_dn)
+                    gradient_imag[iz] += 2.0 * np.real(np.conj(adj) * dU_dkappa)
+
+                    # Adjoint of multiplication by T.
+                    adj = adj * np.conj(T)
+
+                    if iz > 0:
+                        adj = angular_spectrum(
+                            adj, p.wavelength, -p.slice_thickness,
+                            p.pixel_size, p.n_background
+                        )
+
+            norm = max(len(angles), 1)
+            gradient_real /= norm
+            gradient_imag /= norm
+
+            recon.real -= step_size * gradient_real
+            recon.imag -= step_size * gradient_imag
+
             if p.tv_weight > 0:
                 recon = self._tv_proximal(recon, p.tv_weight * step_size)
-            
-            # Constraints
+
             if p.positivity:
-                recon.real = np.clip(recon.real, p.ri_bounds[0], p.ri_bounds[1])
-                recon.imag = np.maximum(recon.imag, 0)
-            
-            avg_error = total_error / len(angles)
+                recon.real = np.clip(
+                    recon.real, p.ri_bounds[0], p.ri_bounds[1]
+                )
+                recon.imag = np.maximum(recon.imag, 0.0)
+
+            avg_error = total_error / norm
             self.errors.append(avg_error)
-            
+
             if progress_callback:
                 progress_callback(iteration, avg_error)
-        
+
         return recon
+
+    def reconstruct_sirt(self, intensities: List[np.ndarray],
+                         angles: Optional[List[float]] = None,
+                         progress_callback=None) -> np.ndarray:
+        """Legacy API alias for the physics-consistent gradient reconstruction.
+
+        The old implementation was a residual backprojection that did not
+        differentiate the multislice forward model.  Calling it SIRT was
+        misleading for diffraction data, so the implementation now delegates
+        to the adjoint-style gradient solver.
+        """
+        return self.reconstruct_gradient(
+            intensities, angles=angles,
+            progress_callback=progress_callback
+        )
 
     def _tv_proximal(self, volume: np.ndarray, weight: float) -> np.ndarray:
         """Proximal operator for total variation regularization.

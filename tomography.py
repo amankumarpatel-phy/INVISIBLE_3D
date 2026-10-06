@@ -13,7 +13,7 @@ Supports limited-angle, full-angle, and missing-angle scenarios.
 import numpy as np
 from typing import Optional, List, Tuple
 from dataclasses import dataclass
-from .propagation import angular_spectrum, tilted_plane_wave, multislice_propagation
+from .propagation import angular_spectrum, tilted_plane_wave, multislice_propagation, born_3d_forward
 from .utils import wavenumber
 
 
@@ -143,6 +143,53 @@ class TomographyEngine:
             intensities.append(np.abs(det_field)**2)
         
         return intensities
+
+    def forward_born_multi_angle(self, object_3d: np.ndarray,
+                                 angles: Optional[List[float]] = None
+                                 ) -> List[np.ndarray]:
+        """Generate complex scattered fields with the first-Born model.
+
+        This is the matching forward model for reconstruct_fbp().  It is
+        useful for algorithm validation because the inverse Ewald mapping
+        assumes first-Born data.
+
+        Returns:
+            Complex scattered detector fields for each illumination angle.
+        """
+        p = self.params
+        if angles is None:
+            angles = p.angles
+
+        if object_3d.shape != (p.Nz, p.Ny, p.Nx):
+            raise ValueError(
+                f"object_3d must have shape {(p.Nz, p.Ny, p.Nx)}, "
+                f"got {object_3d.shape}"
+            )
+
+        k0 = wavenumber(p.wavelength)
+        scattering_potential = (
+            k0**2 * (object_3d**2 - p.n_background**2)
+        )
+
+        scattered_fields = []
+        for theta in angles:
+            inc = tilted_plane_wave(
+                p.Ny, p.Nx, p.pixel_size, p.wavelength,
+                theta_x=theta, theta_y=0, n_medium=p.n_background
+            )
+            total_born = born_3d_forward(
+                inc, scattering_potential,
+                p.wavelength, p.pixel_size,
+                p.slice_thickness, p.z_detector,
+                p.n_background
+            )
+            inc_detector = angular_spectrum(
+                inc, p.wavelength, p.z_detector,
+                p.pixel_size, p.n_background
+            )
+            scattered_fields.append(total_born - inc_detector)
+
+        return scattered_fields
 
     def extract_amplitude(self, intensities: List[np.ndarray]) -> List[np.ndarray]:
         """Convert intensity measurements to measured amplitudes.

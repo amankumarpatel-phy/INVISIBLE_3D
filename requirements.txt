@@ -9,3 +9,8 @@ pytest>=7.4
 # Optional features
 # torch>=2.0
 # scikit-image>=0.21
+
+# API deployment
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
